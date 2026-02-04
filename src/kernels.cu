@@ -66,145 +66,6 @@ __device__ __forceinline__ half float_to_val(float v) { return __float2half(v); 
 #define FA_BC 32
 
 template <typename T>
-__global__ void native_attention_kernel(
-    const T *__restrict__ Q,
-    const T *__restrict__ K,
-    const T *__restrict__ V,
-    T *__restrict__ O,
-    int Batches, int TgtLen, int SrcLen,
-    int nH, int nKV, int D,
-    bool is_causal) {
-    int b = blockIdx.x;
-    int h = blockIdx.y;
-    int t_tile_idx = blockIdx.z;
-
-    int t_start = t_tile_idx * FA_BR;
-    if (t_start >= TgtLen)
-        return;
-    extern __shared__ char smem[];
-    T *sQ = (T *)smem;
-    T *sK = sQ + FA_BR * D;
-    T *sV = sK + FA_BC * D;
-
-    int tid = threadIdx.x;
-    int num_threads = blockDim.x;
-
-    int group_size = nH / nKV;
-    int h_kv = h / group_size;
-
-    float scale = 1.0f / sqrtf((float)D);
-
-    int my_row = tid;
-    bool row_valid = (my_row < FA_BR) && (t_start + my_row < TgtLen);
-    const int MAX_D_REG = 128;
-    float m = -1e30f;
-    float l = 0.0f;
-    float o_reg[MAX_D_REG] = {0.0f};
-
-    size_t q_base = (size_t)b * TgtLen * nH * D + (size_t)h * D;
-    size_t kv_base = (size_t)b * SrcLen * nKV * D + (size_t)h_kv * D;
-    size_t kv_stride = nKV * D;
-
-    int q_elems = FA_BR * D;
-#pragma unroll
-    for (int i = tid; i < q_elems; i += num_threads) {
-        int row = i / D;
-        int col = i % D;
-        int t_idx = t_start + row;
-        if (t_idx < TgtLen) {
-            sQ[row * D + col] = Q[q_base + t_idx * nH * D + col];
-        } else {
-            sQ[row * D + col] = float_to_val<T>(0.0f);
-        }
-    }
-    __syncthreads();
-#pragma unroll
-    for (int s_start = 0; s_start < SrcLen; s_start += FA_BC) {
-        int total_elems = FA_BC * D;
-#pragma unroll
-        for (int i = tid; i < total_elems; i += num_threads) {
-            int row = i / D;
-            int col = i % D;
-            int s_idx = s_start + row;
-            if (s_idx < SrcLen) {
-                sK[row * D + col] = K[kv_base + s_idx * kv_stride + col];
-            } else {
-                sK[row * D + col] = float_to_val<T>(0.0f);
-            }
-        }
-        __syncthreads();
-        if (row_valid) {
-            int t_abs = t_start + my_row;
-#pragma unroll
-            for (int k_idx = 0; k_idx < FA_BC; ++k_idx) {
-                int s_abs = s_start + k_idx;
-                if (s_abs >= SrcLen)
-                    break;
-                if (is_causal && s_abs > t_abs)
-                    break;
-                float score = 0.0f;
-#pragma unroll
-                for (int d = 0; d < D; ++d) {
-                    score += val_to_float(sQ[my_row * D + d]) * val_to_float(sK[k_idx * D + d]);
-                }
-                score *= scale;
-                m = max(score, m);
-            }
-        }
-        __syncthreads();
-    }
-#pragma unroll
-    for (int s_start = 0; s_start < SrcLen; s_start += FA_BC) {
-        int total_elems = FA_BC * D;
-#pragma unroll
-        for (int i = tid; i < total_elems; i += num_threads) {
-            int row = i / D;
-            int col = i % D;
-            int s_idx = s_start + row;
-            if (s_idx < SrcLen) {
-                sK[row * D + col] = K[kv_base + s_idx * kv_stride + col];
-                sV[row * D + col] = V[kv_base + s_idx * kv_stride + col];
-            } else {
-                sK[row * D + col] = float_to_val<T>(0.0f);
-                sV[row * D + col] = float_to_val<T>(0.0f);
-            }
-        }
-        __syncthreads();
-        if (row_valid) {
-            int t_abs = t_start + my_row;
-#pragma unroll
-            for (int k_idx = 0; k_idx < FA_BC; ++k_idx) {
-                int s_abs = s_start + k_idx;
-                if (s_abs >= SrcLen)
-                    break;
-                if (is_causal && s_abs > t_abs)
-                    break;
-                float score = 0.0f;
-#pragma unroll
-                for (int d = 0; d < D; ++d) {
-                    score += val_to_float(sQ[my_row * D + d]) * val_to_float(sK[k_idx * D + d]);
-                }
-                score *= scale;
-                score = expf(score - m);
-                l += score;
-#pragma unroll
-                for (int d = 0; d < D; ++d) {
-                    o_reg[d] += score * val_to_float(sV[k_idx * D + d]);
-                }
-            }
-        }
-        __syncthreads();
-    }
-    if (row_valid) {
-        int t_abs = t_start + my_row;
-#pragma unroll
-        for (int d = 0; d < D; ++d) {
-            O[q_base + t_abs * nH * D + d] = float_to_val<T>(o_reg[d] / l);
-        }
-    }
-}
-
-template <typename T>
 __global__ void flash_attention_kernel(
     const T *__restrict__ Q,
     const T *__restrict__ K,
@@ -360,26 +221,16 @@ void flashAttention(const std::vector<T> &h_q, const std::vector<T> &h_k,
     RUNTIME_CHECK(cudaMemcpy(d_k, h_k.data(), k_size, cudaMemcpyHostToDevice));
     RUNTIME_CHECK(cudaMemcpy(d_v, h_v.data(), v_size, cudaMemcpyHostToDevice));
 
-    // @note: the precision of online-softmax is not enough, falling back to native softmax.
-    bool use_native = (query_heads >= 64 && head_dim == 32 && is_causal && std::is_same<T, float>::value);
-
     dim3 blockSize(FA_BR);
 
     dim3 gridSize(batch_size, query_heads, (target_seq_len + FA_BR - 1) / FA_BR);
 
     size_t smem_size = (FA_BR * head_dim + 2 * FA_BC * head_dim) * sizeof(T);
 
-    if (use_native) {
-        native_attention_kernel<<<gridSize, blockSize, smem_size>>>(
-            d_q, d_k, d_v, d_o,
-            batch_size, target_seq_len, src_seq_len,
-            query_heads, kv_heads, head_dim, is_causal);
-    } else {
-        flash_attention_kernel<<<gridSize, blockSize, smem_size>>>(
-            d_q, d_k, d_v, d_o,
-            batch_size, target_seq_len, src_seq_len,
-            query_heads, kv_heads, head_dim, is_causal);
-    }
+    flash_attention_kernel<<<gridSize, blockSize, smem_size>>>(
+        d_q, d_k, d_v, d_o,
+        batch_size, target_seq_len, src_seq_len,
+        query_heads, kv_heads, head_dim, is_causal);
 
     RUNTIME_CHECK(cudaGetLastError()); // Check launch errors
     RUNTIME_CHECK(cudaDeviceSynchronize());
