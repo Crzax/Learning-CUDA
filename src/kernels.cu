@@ -8,9 +8,31 @@ const size_t BLOCK_SIZE = 256;
 
 template <typename T>
 __global__ void trace_kernel(T *d_input, T *d_ans, size_t N, size_t cols) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < N) {
-        atomicAdd(d_ans, d_input[tid * cols + tid]);
+    __shared__ T smem[32];
+    size_t tid = threadIdx.x;
+    size_t warp_id = tid / warpSize;
+    size_t lane_id = tid % warpSize;
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = blockDim.x * gridDim.x;
+    T val = 0;
+    for (size_t i = idx; i < N; i += stride)
+        val += d_input[i * cols + i];
+
+    for (size_t off = warpSize / 2; off > 0; off >>= 1)
+        val += __shfl_down_sync(0xffffffff, val, off);
+
+    if (lane_id == 0)
+        smem[warp_id] = val;
+
+    __syncthreads();
+
+    if (warp_id == 0) {
+        val = lane_id < blockDim.x / warpSize ? smem[lane_id] : (T)0;
+        for (size_t off = warpSize / 2; off > 0; off >>= 1)
+            val += __shfl_down_sync(0xffffffff, val, off);
+
+        if (lane_id == 0)
+            atomicAdd(d_ans, val);
     }
 }
 
@@ -41,7 +63,8 @@ T trace(const std::vector<T> &h_input, size_t rows, size_t cols) {
     RUNTIME_CHECK(cudaMemcpy(d_ans, &h_ans, sizeof(T), cudaMemcpyHostToDevice));
 
     dim3 blockSize(BLOCK_SIZE);
-    dim3 gridSize((N + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    size_t num_blocks = std::min((size_t)256, (N + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    dim3 gridSize(num_blocks);
     trace_kernel<<<gridSize, blockSize>>>(d_input, d_ans, N, cols);
 
     RUNTIME_CHECK(cudaMemcpy(&h_ans, d_ans, sizeof(T), cudaMemcpyDeviceToHost));
